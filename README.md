@@ -1,6 +1,6 @@
-# Zero-Shot Video Analytics & Multi-Camera Security Surveillance Pipeline
+# Video Analytics & Multi-Camera Security Surveillance Pipeline using pretrained models
 
-End-to-end Edge Compute and Client-side video analytics pipeline powered by **LiquidAI `d1-3B`** (System-One zero-token decision model), **Ultralytics YOLO26s**, **ByteTrack**, **InsightFace `buffalo_l`** (SCRFD-10GF detector + ArcFace ResNet-50 recognizer), and **LanceDB**.
+Edge Compute and Client-side video analytics pipeline powered by **LiquidAI `d1-3B`** (System-One decision model), **Ultralytics YOLO26s**, **ByteTrack**, **InsightFace `buffalo_l`** (SCRFD-10GF detector + ArcFace ResNet-50 recognizer), and **LanceDB**.
 
 ## Architecture & Workflow
 
@@ -8,7 +8,7 @@ End-to-end Edge Compute and Client-side video analytics pipeline powered by **Li
    - Reads real-time streams from security cameras and tracks subjects with stateful per-camera `ByteTrack` trackers (`track_id`).
    - Computes a **context-padded bounding box** (default `+35%` padding around the tight subject bounding box) so the decision model observes surrounding context (e.g., hand gestures, smoke plumes, held objects, PPE compliance, or restricted items).
 2. **System-One Multimodal Decision Model (`LiquidAI/d1-3B`)**:
-   - Evaluates the padded subject crop against the active **Detection Rule** (e.g., *"Is the person in the frame smoking?"*) using `d1-3B`'s single prefill forward pass (`noul` primitive) with **zero autoregressive token generation** (~156 ms median latency at `384x384`).
+   - Evaluates the padded subject crop against the active **Detection Rule** (e.g., *"Is the person in the frame smoking?"*) using `d1-3B` pretrained model, requiring no further training.
 3. **Selective Biometric Detection & ArcFace Recognition (`InsightFace buffalo_l`)**:
    - When `match_probability >= threshold` (or when matching against active watchlist subjects), the subject crop is processed by **InsightFace `buffalo_l`**.
    - Landmark Detection: **SCRFD-10GF** detects 5-point facial keypoints and aligns the face crop to `112x112`.
@@ -23,7 +23,7 @@ End-to-end Edge Compute and Client-side video analytics pipeline powered by **Li
    - Clicking **Verify Subject** promotes the subject to `verified` in LanceDB (locking the vector permanently) and archives the 10-frame incident package in the SQLite **Incident Archive Database** (`verified_incidents.db`).
    - Clicking **Dismiss Alert** immediately deletes the biometric embedding from LanceDB and removes the subject from the live watchlist.
 
-## Output File Structure
+## File Structure
 
 ```text
 zero_shot_surveillance/
@@ -51,5 +51,5 @@ zero_shot_surveillance/
 
 ```bash
 # Run with local MacBook FaceTime HD / USB camera at http://localhost:8000
-python server.py --webcam --host 127.0.0.1 --port 8000
+python server.py --compile --host 127.0.0.1 --port 8000
 ```
