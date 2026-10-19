@@ -1,0 +1,1557 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ZERO-SHOT // SURVEILLANCE — Video Analytics Console</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-[#0a0b0e] text-[#e4e4e7] m-0 p-0 overflow-hidden">
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const IconStub = ({ className = "w-3.5 h-3.5" }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+    <circle cx="12" cy="12" r="9" />
+  </svg>
+);
+const Search = IconStub, Video = IconStub, Check = IconStub, X = IconStub,
+      ChevronLeft = IconStub, ChevronRight = IconStub, Play = IconStub, Pause = IconStub,
+      ShieldAlert = IconStub, LayoutGrid = IconStub, FileText = IconStub, Sliders = IconStub,
+      Trash2 = IconStub, Eye = IconStub, EyeOff = IconStub, Camera = IconStub;
+
+
+const DETECTION_RULE_PRESETS = [
+  { label: 'Smoking Detection', rule: 'Is the person in the frame smoking?' },
+  { label: 'Missing Hard Hat (PPE)', rule: 'Is the person not wearing a safety hard hat?' },
+  { label: 'Unattended / Suspicious Package', rule: 'Is the person carrying a suspicious bag or package?' }
+];
+
+function App() {
+  // --- Navigation & View State ---
+  const [activeView, setActiveView] = useState('dashboard'); // 'dashboard' | 'incidents'
+  const [incidentFilter, setIncidentFilter] = useState('ALL'); // 'ALL' | 'UNVERIFIED' | 'VERIFIED' | 'LANCEDB'
+  const [showSettingsDrawer, setShowSettingsDrawer] = useState(false);
+
+  // --- Pipeline Configuration State ---
+  const [ruleInput, setRuleInput] = useState('Is the person in the frame smoking?');
+  const [activeRule, setActiveRule] = useState('Is the person in the frame smoking?');
+  const [threshold, setThreshold] = useState(0.65);
+  const [paddingRatio, setPaddingRatio] = useState(0.35);
+  const [verificationTimeoutSec, setVerificationTimeoutSec] = useState(45);
+  const [showPaddedOverlay, setShowPaddedOverlay] = useState(true);
+
+  // --- Stream & WebSocket State ---
+  const [wsConnected, setWsConnected] = useState(false);
+  const [currentFps, setCurrentFps] = useState(0);
+  const [vlmLatencyMs, setVlmLatencyMs] = useState(0);
+
+  // --- Flagged Subjects, 10-Frame Incident Buffers & Databases ---
+  const [subjects, setSubjects] = useState({}); // subjectId -> FlaggedSubjectRecord
+  const [selectedSubjectId, setSelectedSubjectId] = useState(null);
+  const [selectedFrameIdx, setSelectedFrameIdx] = useState(0);
+  const [isPlayingReplay, setIsPlayingReplay] = useState(false);
+  const [replayViewMode, setReplayViewMode] = useState('full'); // 'full' | 'crop'
+  const [incidentArchive, setIncidentArchive] = useState([]);
+  const [toastMessage, setToastMessage] = useState(null);
+  const [nowMs, setNowMs] = useState(Date.now());
+
+  // --- Refs for High-FPS Video & Non-Blocking Canvas Overlay ---
+  const overlayCanvasRef = useRef(null);
+  const wsCanvasRef = useRef(null);
+  const wsRef = useRef(null);
+  const subjectsRef = useRef(subjects);
+  const liveTracksRef = useRef([]);
+  const sourceDimsRef = useRef({ width: 1280, height: 720 });
+  const paddingRatioRef = useRef(paddingRatio);
+  const showPaddedRef = useRef(showPaddedOverlay);
+
+  useEffect(() => {
+    subjectsRef.current = subjects;
+  }, [subjects]);
+
+  useEffect(() => {
+    paddingRatioRef.current = paddingRatio;
+  }, [paddingRatio]);
+
+  useEffect(() => {
+    showPaddedRef.current = showPaddedOverlay;
+  }, [showPaddedOverlay]);
+
+  const triggerToast = useCallback((text, type = 'info') => {
+    setToastMessage({ text, type });
+    setTimeout(() => {
+      setToastMessage((prev) => (prev && prev.text === text ? null : prev));
+    }, 3200);
+  }, []);
+
+  // --- Normalize Backend Flagged Subject Payload (Capped at 10 incident frames) ---
+  const normalizeBackendSubject = useCallback((s) => {
+    const rawFrames = s.frames.slice(0, 10);
+    return {
+      subjectId: s.subject_id,
+      status: s.status, // 'unverified' (yellow) | 'verified' (red)
+      detectionRule: s.detection_rule,
+      initialConfidence: s.initial_confidence,
+      peakConfidence: s.peak_confidence,
+      createdAt: s.created_at * 1000,
+      expiresAt: s.expires_at ? s.expires_at * 1000 : null,
+      verifiedAt: s.verified_at ? s.verified_at * 1000 : null,
+      camerasSeen: s.cameras_seen,
+      trackId: Object.values(s.active_tracks)[0],
+      latestBbox: s.latest_bbox,
+      frameWidth: s.frame_width,
+      frameHeight: s.frame_height,
+      hasFaceEmbedding: s.has_face_embedding,
+      faceCropB64: s.face_crop_b64,
+      frames: rawFrames.map((f, idx) => ({
+        frameId: f.frame_id,
+        frameNumber: idx + 1,
+        cameraId: f.camera_id,
+        trackId: f.track_id,
+        timestamp: f.timestamp * 1000,
+        relSeconds: (f.timestamp - s.created_at).toFixed(2),
+        matchProb: f.match_probability,
+        bbox: f.bbox,
+        cropB64: f.crop_b64,
+        fullFrameB64: f.full_frame_b64
+      }))
+    };
+  }, []);
+
+  // --- Connect to Python Edge Compute Backend WebSocket (/ws) ---
+  useEffect(() => {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+    wsRef.current = ws;
+
+    const cachedImg = new Image();
+    cachedImg.onload = () => {
+      const c = wsCanvasRef.current;
+      if (c.width !== cachedImg.width || c.height !== cachedImg.height) {
+        c.width = cachedImg.width;
+        c.height = cachedImg.height;
+      }
+      c.getContext('2d').drawImage(cachedImg, 0, 0);
+    };
+
+    ws.onopen = () => {
+      setWsConnected(true);
+      triggerToast('CONNECTED TO EDGE ANALYTICS SERVER (WS)', 'emerald');
+    };
+
+    ws.onmessage = (ev) => {
+      const data = JSON.parse(ev.data);
+      if (data.type === 'state_snapshot') {
+        setActiveRule(data.detection_rule);
+        setRuleInput(data.detection_rule);
+        setThreshold(data.threshold);
+        setVerificationTimeoutSec(data.verification_timeout_sec);
+        const map = {};
+        data.subjects.forEach((s) => {
+          const norm = normalizeBackendSubject(s);
+          map[norm.subjectId] = norm;
+        });
+        setSubjects(map);
+        const firstId = Object.keys(map)[0];
+        if (firstId) setSelectedSubjectId((prev) => prev || firstId);
+      } else if (data.type === 'camera_frame') {
+        cachedImg.src = data.frame_b64;
+        sourceDimsRef.current = { width: data.frame_width, height: data.frame_height };
+        liveTracksRef.current = data.tracks;
+        setVlmLatencyMs(Math.round(data.decision_latency_ms));
+      } else if (data.type === 'subject_flagged' || data.type === 'subject_updated') {
+        const norm = normalizeBackendSubject(data.subject);
+        setSubjects((prev) => ({ ...prev, [norm.subjectId]: norm }));
+        setSelectedSubjectId((prev) => prev || norm.subjectId);
+        if (data.type === 'subject_flagged') {
+          triggerToast(`FLAGGED SUBJECT ${norm.subjectId} DETECTED [YELLOW BOX]`, 'amber');
+        }
+      } else if (data.type === 'subject_verified') {
+        const norm = normalizeBackendSubject(data.subject);
+        setSubjects((prev) => ({ ...prev, [norm.subjectId]: norm }));
+        triggerToast(`SUBJECT ${norm.subjectId} VERIFIED [RED BOX LOCKED]`, 'red');
+      } else if (data.type === 'subject_dismissed' || data.type === 'subject_expired') {
+        const sid = data.subject_id;
+        setSubjects((prev) => {
+          const next = { ...prev };
+          delete next[sid];
+          return next;
+        });
+        triggerToast(
+          data.type === 'subject_expired'
+            ? `VERIFICATION TTL EXPIRED: ${sid} PURGED FROM LANCEDB`
+            : `ALERT DISMISSED: ${sid} REMOVED FROM LANCEDB`,
+          'neutral'
+        );
+      }
+    };
+
+    ws.onclose = () => {
+      setWsConnected(false);
+      liveTracksRef.current = [];
+    };
+    return () => ws.close();
+  }, [normalizeBackendSubject, triggerToast]);
+
+  // --- 100ms Ticker for Live Verification TTL Countdowns & Auto-Purge from LanceDB ---
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = Date.now();
+      setNowMs(now);
+
+      const currentSubjects = subjectsRef.current;
+      const expiredIds = [];
+      Object.values(currentSubjects).forEach((s) => {
+        if (s.status === 'unverified' && s.expiresAt && now >= s.expiresAt) {
+          expiredIds.push(s.subjectId);
+        }
+      });
+
+      if (expiredIds.length > 0) {
+        setSubjects((prev) => {
+          const next = { ...prev };
+          expiredIds.forEach((id) => delete next[id]);
+          return next;
+        });
+        triggerToast(`TTL EXPIRED: ${expiredIds.join(', ')} PURGED FROM LANCEDB`, 'amber');
+      }
+    }, 100);
+    return () => clearInterval(timer);
+  }, [triggerToast]);
+
+  // --- Auto-Play 10-Frame Incident Sequence Replay ---
+  useEffect(() => {
+    if (!isPlayingReplay) return;
+    const currentSubject = selectedSubjectId ? subjects[selectedSubjectId] : null;
+    if (!currentSubject || !currentSubject.frames.length) return;
+
+    const timer = setInterval(() => {
+      setSelectedFrameIdx((prev) => (prev + 1) % currentSubject.frames.length);
+    }, 220);
+    return () => clearInterval(timer);
+  }, [isPlayingReplay, selectedSubjectId, subjects]);
+
+  // --- 60 FPS Non-Blocking Vector Overlay Loop (Uses Real Subject Coordinates — Never Duplicates) ---
+  useEffect(() => {
+    let animId;
+    let frames = 0;
+    let lastTime = performance.now();
+
+    const drawSubjectBox = (ctx, W, H, bbox, srcW, srcH, subjectId, status, confidence, trackId) => {
+      const scaleX = W / srcW;
+      const scaleY = H / srcH;
+
+      const bx1 = Math.round(bbox.x1 * scaleX);
+      const by1 = Math.round(bbox.y1 * scaleY);
+      const bx2 = Math.round(bbox.x2 * scaleX);
+      const by2 = Math.round(bbox.y2 * scaleY);
+      const bw = Math.max(16, bx2 - bx1);
+      const bh = Math.max(24, by2 - by1);
+
+      const isVerified = status === 'verified';
+
+      // Context-padded bounding box fed to LiquidAI/d1-3B
+      const padX = Math.round(bw * paddingRatioRef.current);
+      const padY = Math.round(bh * paddingRatioRef.current);
+      const px1 = bbox.padded_x1 != null ? Math.round(bbox.padded_x1 * scaleX) : Math.max(6, bx1 - padX);
+      const py1 = bbox.padded_y1 != null ? Math.round(bbox.padded_y1 * scaleY) : Math.max(6, by1 - padY);
+      const px2 = bbox.padded_x2 != null ? Math.round(bbox.padded_x2 * scaleX) : Math.min(W - 6, bx2 + padX);
+      const py2 = bbox.padded_y2 != null ? Math.round(bbox.padded_y2 * scaleY) : Math.min(H - 6, by2 + padY);
+
+      if (showPaddedRef.current) {
+        ctx.save();
+        ctx.setLineDash([5, 4]);
+        ctx.strokeStyle = isVerified ? 'rgba(239, 68, 68, 0.5)' : 'rgba(234, 179, 8, 0.55)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(px1, py1, px2 - px1, py2 - py1);
+
+        ctx.fillStyle = 'rgba(10, 11, 14, 0.85)';
+        ctx.fillRect(px1, Math.max(0, py1 - 18), 195, 16);
+        ctx.fillStyle = '#a1a1aa';
+        ctx.font = '600 10px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+        ctx.fillText(
+          `d1-3B CONTEXT CROP [+${Math.round(paddingRatioRef.current * 100)}%]`,
+          px1 + 5,
+          Math.max(11, py1 - 6)
+        );
+        ctx.restore();
+      }
+
+      // Primary Tactical Bounding Box: YELLOW for Unverified Alert, RED for Verified Subject
+      const primaryColor = isVerified ? '#ef4444' : '#eab308';
+      const headerBg = isVerified ? '#dc2626' : '#ca8a04';
+      const statusTag = isVerified ? '[VERIFIED SUBJECT]' : '[UNVERIFIED ALERT]';
+
+      ctx.save();
+      ctx.strokeStyle = primaryColor;
+      ctx.lineWidth = isVerified ? 3 : 2.5;
+      ctx.shadowColor = primaryColor;
+      ctx.shadowBlur = isVerified ? 12 : 6;
+      ctx.strokeRect(bx1, by1, bw, bh);
+      ctx.restore();
+
+      // Top Tactical Header Bar on Bounding Box
+      const headerH = 24;
+      const headerW = Math.max(bw, 145);
+      ctx.fillStyle = headerBg;
+      ctx.fillRect(bx1, Math.max(0, by1 - headerH), headerW, headerH);
+
+      ctx.fillStyle = isVerified ? '#ffffff' : '#090a0d';
+      ctx.font = '700 11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+      const confStr = `${confidence.toFixed(2)} CONF`;
+      ctx.fillText(`${subjectId}  ${confStr}`, bx1 + 7, Math.max(15, by1 - 8));
+
+      // Bottom Tactical Telemetry Bar inside Bounding Box
+      if (bh > 60 && bw > 110) {
+        const footerH = 22;
+        ctx.fillStyle = 'rgba(10, 11, 14, 0.90)';
+        ctx.fillRect(bx1 + 2, by1 + bh - footerH - 2, bw - 4, footerH);
+        ctx.fillStyle = primaryColor;
+        ctx.font = '700 10px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+        ctx.fillText(
+          `${statusTag} // #${trackId}`,
+          bx1 + 6,
+          by1 + bh - 8
+        );
+      }
+    };
+
+    const renderLoop = (ts) => {
+      animId = requestAnimationFrame(renderLoop);
+      frames++;
+      if (ts - lastTime >= 1000) {
+        setCurrentFps(Math.min(60, Math.round((frames * 1000) / (ts - lastTime))));
+        frames = 0;
+        lastTime = ts;
+      }
+
+      const canvas = overlayCanvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const W = canvas.width || 1280;
+      const H = canvas.height || 720;
+      ctx.clearRect(0, 0, W, H);
+
+      const activeSubjectsMap = subjectsRef.current;
+      const liveTracks = liveTracksRef.current;
+
+      // Draw real-time tracked subjects at their exact YOLO26s + ByteTrack coordinates
+      liveTracks.forEach((t) => {
+          const sid = t.subject_id;
+          if (!sid) return;
+          const subjRec = activeSubjectsMap[sid];
+          // Only draw if the subject is still active (not dismissed or expired)
+          const activeStatus = subjRec ? subjRec.status : t.subject_status;
+          if (!activeStatus || activeStatus === 'dismissed' || activeStatus === 'expired') return;
+
+          drawSubjectBox(
+            ctx,
+            W,
+            H,
+            t.bbox,
+            t.frame_width,
+            t.frame_height,
+            sid,
+            activeStatus,
+            subjRec ? subjRec.peakConfidence : t.match_probability,
+            t.track_id
+          );
+      });
+
+        };
+
+    animId = requestAnimationFrame(renderLoop);
+    return () => cancelAnimationFrame(animId);
+  }, []);
+
+  // --- Verify Flagged Subject (Turns Bounding Box RED & Locks Embedding in LanceDB) ---
+  const handleVerifySubject = useCallback(
+    (sid) => {
+      if (!sid) return;
+      if (wsConnected && wsRef.current) {
+        wsRef.current.send(JSON.stringify({ action: 'verify_subject', subject_id: sid }));
+      }
+      const target = subjects[sid];
+      if (!target) return;
+
+      const verifiedTime = Date.now();
+      setSubjects((prev) => {
+        if (!prev[sid]) return prev;
+        return {
+          ...prev,
+          [sid]: {
+            ...prev[sid],
+            status: 'verified', // Turns live bounding box RED
+            verifiedAt: verifiedTime,
+            expiresAt: null
+          }
+        };
+      });
+
+      setIncidentArchive((prev) => [
+        {
+          subjectId: target.subjectId,
+          detectionRule: target.detectionRule,
+          peakConfidence: target.peakConfidence,
+          verifiedAt: verifiedTime,
+          camerasSeen: target.camerasSeen,
+          frameCount: target.frames.length,
+          frames: target.frames
+        },
+        ...prev.filter((e) => e.subjectId !== sid)
+      ]);
+
+      triggerToast(`VERIFIED ${sid} // BOUNDING BOX TURNED RED & LOCKED IN LANCEDB`, 'red');
+    },
+    [subjects, wsConnected, triggerToast]
+  );
+
+  // --- Dismiss Alert (Purges Vector from LanceDB & Clears Bounding Box) ---
+  const handleDismissSubject = useCallback(
+    (sid) => {
+      if (!sid) return;
+      if (wsConnected && wsRef.current) {
+        wsRef.current.send(JSON.stringify({ action: 'dismiss_subject', subject_id: sid }));
+      }
+      setSubjects((prev) => {
+        const next = { ...prev };
+        delete next[sid];
+        return next;
+      });
+      if (selectedSubjectId === sid) {
+        const remainingIds = Object.keys(subjects).filter((k) => k !== sid);
+        setSelectedSubjectId(remainingIds[0] || null);
+        setSelectedFrameIdx(0);
+      }
+      triggerToast(`ALERT DISMISSED ${sid} // VECTOR PURGED FROM LANCEDB`, 'neutral');
+    },
+    [selectedSubjectId, subjects, wsConnected, triggerToast]
+  );
+
+  // --- Apply New Zero-Shot Detection Rule ---
+  const handleApplyDetectionRule = useCallback(
+    (ruleText) => {
+      const clean = (ruleText || '').trim();
+      if (!clean) return;
+      setRuleInput(clean);
+      setActiveRule(clean);
+      if (wsConnected && wsRef.current) {
+        wsRef.current.send(
+          JSON.stringify({
+            action: 'set_detection_rule',
+            detection_rule: clean,
+            threshold,
+            verification_timeout_sec: verificationTimeoutSec
+          })
+        );
+      }
+      triggerToast(`DETECTION RULE UPDATED: "${clean}"`, 'emerald');
+    },
+    [verificationTimeoutSec, threshold, triggerToast, wsConnected]
+  );
+
+  const allSubjectsList = Object.values(subjects).sort((a, b) => b.createdAt - a.createdAt);
+  const unverifiedList = allSubjectsList.filter((s) => s.status === 'unverified');
+  const verifiedList = allSubjectsList.filter((s) => s.status === 'verified');
+  const selectedSubject = selectedSubjectId ? subjects[selectedSubjectId] : allSubjectsList[0] || null;
+  const activeFrames = selectedSubject ? selectedSubject.frames : [];
+  const currentFrame =
+    activeFrames.length > 0 ? activeFrames[Math.min(selectedFrameIdx, activeFrames.length - 1)] : null;
+
+  return (
+    <div className="h-screen max-h-screen bg-[#0a0b0e] text-[#e4e4e7] font-mono flex flex-col select-none overflow-hidden">
+      {/* Custom Scrollbar Styling for Internal Scrollable Containers */}
+      <style>{`
+        .tactical-scroll::-webkit-scrollbar { width: 5px; height: 5px; }
+        .tactical-scroll::-webkit-scrollbar-track { background: #090a0d; }
+        .tactical-scroll::-webkit-scrollbar-thumb { background: #272b38; border-radius: 3px; }
+        .tactical-scroll::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+      `}</style>
+
+      {/* Tactical Toast Notification */}
+      {toastMessage && (
+        <div className="fixed top-14 right-5 z-50 pointer-events-none">
+          <div
+            className={`px-3.5 py-2 rounded border text-xs font-bold tracking-wider uppercase shadow-2xl flex items-center gap-2 ${
+              toastMessage.type === 'red'
+                ? 'bg-[#2a0a0e]/95 border-[#dc2626] text-[#fca5a5]'
+                : toastMessage.type === 'amber'
+                ? 'bg-[#281b05]/95 border-[#f59e0b] text-[#fde68a]'
+                : toastMessage.type === 'emerald'
+                ? 'bg-[#062419]/95 border-[#10b981] text-[#a7f3d0]'
+                : 'bg-[#14171f]/95 border-[#3f3f46] text-[#e4e4e7]'
+            }`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full ${
+                toastMessage.type === 'red'
+                  ? 'bg-[#ef4444]'
+                  : toastMessage.type === 'amber'
+                  ? 'bg-[#f59e0b]'
+                  : 'bg-[#10b981]'
+              }`}
+            />
+            {toastMessage.text}
+          </div>
+        </div>
+      )}
+
+      {/* =====================================================================
+          ROW 1: TOP TACTICAL HEADER BAR (FIXED HEIGHT)
+      ===================================================================== */}
+      <header className="shrink-0 bg-[#0d0f13] border-b border-[#222631] px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-3">
+          <div className="bg-[#14171f] border border-[#2a2f3d] px-2.5 py-1.5 rounded flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-[#ef4444] animate-pulse" />
+            <div className="text-[11px] font-bold leading-tight tracking-wider text-white">
+              <div>ZERO-SHOT //</div>
+              <div>SURVEILLANCE</div>
+            </div>
+          </div>
+          <div>
+            <h1 className="text-xs sm:text-sm font-bold tracking-widest uppercase text-white leading-tight">
+              {activeView === 'dashboard'
+                ? 'LIVE VIDEO STREAM & SUBJECT ANALYTICS'
+                : 'INCIDENT FRAMES & LANCEDB VECTOR AUDIT'}
+            </h1>
+            <p className="text-[10px] text-[#71717a] tracking-wider uppercase mt-0.5">
+              LIQUIDAI/d1-3B • ULTRALYTICS YOLO26s • BYTETRACK • INSIGHTFACE BUFFALO_L (ARCFACE R50) • LANCEDB
+            </p>
+          </div>
+        </div>
+
+        {/* Right Telemetry Modules */}
+        <div className="flex flex-wrap items-center gap-2 text-[10px]">
+          <div className="bg-[#111318] border border-[#232732] px-2.5 py-1 rounded flex items-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#10b981]" />
+            <span className="text-[#71717a]">VLM ENGINE:</span>
+            <span className="text-white font-bold">d1-3B [NOUL]</span>
+          </div>
+
+          <div className="bg-[#111318] border border-[#232732] px-2.5 py-1 rounded flex items-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#10b981]" />
+            <span className="text-[#71717a]">STREAM:</span>
+            <span className="text-[#10b981] font-bold">
+              {wsConnected ? `ONLINE (${currentFps} FPS)` : 'OFFLINE'}
+            </span>
+          </div>
+
+          <div className="bg-[#111318] border border-[#232732] px-2.5 py-1 rounded flex items-center gap-2">
+            <span className="text-[#71717a]">UNVERIFIED:</span>
+            <span className="text-[#eab308] font-bold">{unverifiedList.length} [YELLOW]</span>
+          </div>
+
+          <div className="bg-[#111318] border border-[#232732] px-2.5 py-1 rounded flex items-center gap-2">
+            <span className="text-[#71717a]">VERIFIED:</span>
+            <span className="text-[#ef4444] font-bold">{verifiedList.length} [RED]</span>
+          </div>
+
+          <div className="bg-[#111318] border border-[#232732] px-2.5 py-1 rounded flex items-center gap-2">
+            <span className="text-[#71717a]">LANCEDB:</span>
+            <span className="text-[#22c55e] font-bold">{allSubjectsList.length} VECTORS</span>
+          </div>
+        </div>
+      </header>
+
+      {/* =====================================================================
+          ROW 2: DETECTION RULE BAR (FIXED HEIGHT)
+      ===================================================================== */}
+      <section className="shrink-0 bg-[#0f1116] border-b border-[#222631] px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleApplyDetectionRule(ruleInput);
+          }}
+          className="flex flex-wrap items-center gap-2 flex-1 min-w-[280px]"
+        >
+          <div className="flex items-center gap-1.5 text-[11px] font-bold text-[#a1a1aa] uppercase tracking-wider">
+            <Search className="w-3.5 h-3.5 text-[#ef4444]" />
+            <span>DETECTION RULE:</span>
+          </div>
+
+          <div className="relative flex-1 min-w-[220px] max-w-xl">
+            <input
+              type="text"
+              value={ruleInput}
+              onChange={(e) => setRuleInput(e.target.value)}
+              placeholder="Define zero-shot visual detection rule..."
+              className="w-full bg-[#090a0d] border border-[#272b38] focus:border-[#e4e4e7] rounded px-3 py-1.5 pr-24 text-xs text-white focus:outline-none"
+            />
+            <span className="absolute right-2 top-1/2 -translate-y-1/2 px-1.5 py-0.5 rounded bg-[#181b24] border border-[#2d3242] text-[9px] text-[#9ca3af] uppercase">
+              MODE: NOUL
+            </span>
+          </div>
+
+          <button
+            type="submit"
+            className="px-3.5 py-1.5 rounded bg-white hover:bg-[#e4e4e7] text-[#090a0d] font-bold text-xs uppercase tracking-wider transition"
+          >
+            APPLY RULE
+          </button>
+        </form>
+
+        {/* Rule Presets & Parameter Controls */}
+        <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+          <span className="text-[#71717a] uppercase mr-1">PRESETS:</span>
+          {DETECTION_RULE_PRESETS.map((item) => {
+            const isActive = activeRule === item.rule;
+            return (
+              <button
+                key={item.label}
+                type="button"
+                onClick={() => handleApplyDetectionRule(item.rule)}
+                className={`px-2.5 py-1 rounded border text-[11px] transition ${
+                  isActive
+                    ? 'bg-[#2a0d12] border-[#dc2626] text-[#fca5a5] font-bold'
+                    : 'bg-[#12151c] border-[#262b38] text-[#a1a1aa] hover:text-white'
+                }`}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+
+          <button
+            type="button"
+            onClick={() => setShowSettingsDrawer((prev) => !prev)}
+            className={`ml-1 px-2.5 py-1 rounded border text-[11px] flex items-center gap-1 transition ${
+              showSettingsDrawer
+                ? 'bg-white text-black border-white font-bold'
+                : 'bg-[#12151c] border-[#262b38] text-[#a1a1aa] hover:text-white'
+            }`}
+          >
+            <Sliders className="w-3 h-3" />
+            <span>PARAMS ({Math.round(threshold * 100)}% / {verificationTimeoutSec}s)</span>
+          </button>
+        </div>
+      </section>
+
+      {/* Collapsible Pipeline Hyperparameters Bar */}
+      {showSettingsDrawer && (
+        <div className="shrink-0 bg-[#12151c] border-b border-[#262b38] px-4 py-2 grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
+          <div className="bg-[#0b0d12] border border-[#222631] p-2 rounded">
+            <div className="flex justify-between text-[11px] mb-1">
+              <span className="text-[#71717a]">ALERT CONFIDENCE THRESHOLD:</span>
+              <span className="text-[#10b981] font-bold">{Math.round(threshold * 100)}%</span>
+            </div>
+            <input
+              type="range"
+              min="0.35"
+              max="0.90"
+              step="0.05"
+              value={threshold}
+              onChange={(e) => setThreshold(Number(e.target.value))}
+              className="w-full accent-[#ef4444]"
+            />
+          </div>
+
+          <div className="bg-[#0b0d12] border border-[#222631] p-2 rounded">
+            <div className="flex justify-between text-[11px] mb-1">
+              <span className="text-[#71717a]">BBOX CONTEXT PADDING:</span>
+              <span className="text-[#eab308] font-bold">+{Math.round(paddingRatio * 100)}%</span>
+            </div>
+            <input
+              type="range"
+              min="0.10"
+              max="0.60"
+              step="0.05"
+              value={paddingRatio}
+              onChange={(e) => setPaddingRatio(Number(e.target.value))}
+              className="w-full accent-[#eab308]"
+            />
+          </div>
+
+          <div className="bg-[#0b0d12] border border-[#222631] p-2 rounded">
+            <div className="flex justify-between text-[11px] mb-1">
+              <span className="text-[#71717a]">VERIFICATION TTL (LANCEDB AUTO-PURGE):</span>
+              <span className="text-[#ef4444] font-bold">{verificationTimeoutSec}s</span>
+            </div>
+            <input
+              type="range"
+              min="15"
+              max="120"
+              step="5"
+              value={verificationTimeoutSec}
+              onChange={(e) => setVerificationTimeoutSec(Number(e.target.value))}
+              className="w-full accent-[#ef4444]"
+            />
+          </div>
+        </div>
+      )}
+
+      {/* =====================================================================
+          MAIN WORKSPACE AREA (FIXED VIEWPORT HEIGHT — SCROLLABLE PANELS)
+      ===================================================================== */}
+      {activeView === 'dashboard' ? (
+        <main className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-3 p-3 overflow-hidden">
+          {/* LEFT COLUMN (2 cols): LIVE STREAMS & SCROLLABLE FLAGGED SUBJECT WATCHLIST */}
+          <div className="lg:col-span-2 h-full min-h-0 flex flex-col overflow-hidden">
+            <div className="bg-[#111318] border border-[#222631] rounded p-2.5 flex flex-col gap-2.5 h-full min-h-0 overflow-hidden">
+              <div className="shrink-0 flex items-center justify-between border-b border-[#222631] pb-2">
+                <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-white">
+                  <Video className="w-3.5 h-3.5 text-[#ef4444]" />
+                  <span>LIVE STREAMS (01)</span>
+                </div>
+                <span className="px-1.5 py-0.5 rounded bg-[#2a0d12] border border-[#dc2626] text-[9px] font-bold text-[#ef4444]">
+                  REC
+                </span>
+              </div>
+
+              {/* Primary Camera Card */}
+              <div
+                className={`shrink-0 p-2.5 rounded border bg-[#0b0d11] transition ${
+                  verifiedList.length > 0
+                    ? 'border-[#dc2626]'
+                    : unverifiedList.length > 0
+                    ? 'border-[#eab308]'
+                    : 'border-[#262b38]'
+                }`}
+              >
+                <div className="flex items-center justify-between text-[11px] font-bold">
+                  <span className="flex items-center gap-1.5 text-white">
+                    <span
+                      className={`w-2 h-2 rounded-full ${
+                        verifiedList.length > 0
+                          ? 'bg-[#ef4444]'
+                          : unverifiedList.length > 0
+                          ? 'bg-[#eab308]'
+                          : 'bg-[#10b981]'
+                      }`}
+                    />
+                    CAM 01
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${
+                      verifiedList.length > 0
+                        ? 'bg-[#2a0d12] text-[#ef4444] border border-[#dc2626]/50'
+                        : unverifiedList.length > 0
+                        ? 'bg-[#281b05] text-[#eab308] border border-[#eab308]/50'
+                        : 'bg-[#062419] text-[#10b981]'
+                    }`}
+                  >
+                    {verifiedList.length > 0
+                      ? 'VERIFIED'
+                      : unverifiedList.length > 0
+                      ? 'UNVERIFIED'
+                      : 'NORM'}
+                  </span>
+                </div>
+
+                <div className="my-2 h-14 rounded bg-[#07080a] border border-[#1d212b] flex flex-col items-center justify-center relative">
+                  <div
+                    className={`w-5 h-9 border-2 ${
+                      verifiedList.length > 0
+                        ? 'border-[#ef4444]'
+                        : unverifiedList.length > 0
+                        ? 'border-[#eab308]'
+                        : 'border-[#27272a]'
+                    }`}
+                  />
+                  {selectedSubject && (
+                    <span className="absolute bottom-1 right-1 px-1 py-0.2 bg-[#14171f] border border-[#2d3242] text-[8px] text-white">
+                      {selectedSubject.peakConfidence.toFixed(2)} CONF
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-between text-[10px] text-[#71717a]">
+                  <span>Primary Feed</span>
+                  <span>{currentFps} FPS</span>
+                </div>
+              </div>
+
+              {/* Scrollable Flagged Subjects Watchlist */}
+              <div className="border-t border-[#222631] pt-2 flex-1 min-h-0 flex flex-col overflow-hidden">
+                <div className="shrink-0 flex items-center justify-between text-[10px] text-[#a1a1aa] font-bold uppercase mb-2">
+                  <span>FLAGGED SUBJECTS</span>
+                  <span>({allSubjectsList.length})</span>
+                </div>
+
+                <div className="flex-1 min-h-0 space-y-2 overflow-y-auto pr-1 tactical-scroll">
+                  {allSubjectsList.length === 0 ? (
+                    <div className="p-3 rounded border border-dashed border-[#262b38] text-[10px] text-[#71717a] text-center">
+                      NO FLAGGED SUBJECTS.
+                    </div>
+                  ) : (
+                    allSubjectsList.map((s) => {
+                      const isUnverified = s.status === 'unverified';
+                      const isSel = selectedSubject && selectedSubject.subjectId === s.subjectId;
+                      const remSec =
+                        isUnverified && s.expiresAt ? Math.max(0, (s.expiresAt - nowMs) / 1000).toFixed(1) : null;
+                      return (
+                        <div
+                          key={s.subjectId}
+                          onClick={() => {
+                            setSelectedSubjectId(s.subjectId);
+                            setSelectedFrameIdx(0);
+                          }}
+                          className={`cursor-pointer p-2 rounded border text-[10px] transition ${
+                            isSel ? 'bg-[#171b24] border-white' : 'bg-[#0b0d12] border-[#232732]'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between font-bold">
+                            <span className="text-white">{s.subjectId}</span>
+                            <span
+                              className={`px-1.5 py-0.5 rounded text-[9px] uppercase ${
+                                isUnverified
+                                  ? 'bg-[#eab308] text-black font-extrabold'
+                                  : 'bg-[#dc2626] text-white font-extrabold'
+                              }`}
+                            >
+                              {isUnverified ? 'YELLOW' : 'RED'}
+                            </span>
+                          </div>
+                          <div className="text-[#9ca3af] truncate mt-1">
+                            Match: {(s.peakConfidence * 100).toFixed(1)}% • {s.frames.length}/10 FRM
+                          </div>
+                          {isUnverified && remSec !== null && (
+                            <div className="mt-1.5">
+                              <div className="flex justify-between text-[9px] text-[#eab308] mb-0.5">
+                                <span>TTL PURGE:</span>
+                                <span>{remSec}s</span>
+                              </div>
+                              <div className="w-full h-1 bg-[#1f2430] rounded overflow-hidden">
+                                <div
+                                  className="h-full bg-[#eab308]"
+                                  style={{
+                                    width: `${Math.min(100, (Number(remSec) / verificationTimeoutSec) * 100)}%`
+                                  }}
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* CENTER COLUMN (7 cols): LOCKED-GEOMETRY LIVE VIDEO STREAM VIEWPORT */}
+          <div className="lg:col-span-7 h-full min-h-0 flex flex-col overflow-hidden">
+            <div className="bg-[#111318] border border-[#222631] rounded p-3 flex flex-col h-full min-h-0 overflow-hidden">
+              {/* Viewport Top Header */}
+              <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[#222631]">
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-white">
+                    <span
+                      className={`w-2 h-2 rounded-full ${
+                        verifiedList.length > 0
+                          ? 'bg-[#ef4444]'
+                          : unverifiedList.length > 0
+                          ? 'bg-[#eab308]'
+                          : 'bg-[#10b981]'
+                      }`}
+                    />
+                    <span>CAM 01 // LIVE VIDEO STREAM</span>
+                  </div>
+                  <span className="px-2 py-0.5 rounded bg-[#0b0d12] border border-[#232732] text-[10px] text-[#a1a1aa]">
+                    {currentFps} FPS
+                  </span>
+                  <span className="text-[10px] text-[#71717a]">
+                    LATENCY: <strong className="text-white">{vlmLatencyMs}ms</strong>
+                  </span>
+                </div>
+
+                {/* Right Subject Status Banner */}
+                {selectedSubject ? (
+                  <div
+                    className={`px-2.5 py-0.5 rounded border text-[10px] font-bold uppercase tracking-wider ${
+                      selectedSubject.status === 'verified'
+                        ? 'bg-[#2a0a0e] border-[#dc2626] text-[#ef4444]'
+                        : 'bg-[#281b05] border-[#eab308] text-[#eab308]'
+                    }`}
+                  >
+                    {selectedSubject.status === 'verified'
+                      ? `VERIFIED SUBJECT [RED BOX] // ${selectedSubject.subjectId}`
+                      : `UNVERIFIED ALERT [YELLOW BOX] // ${selectedSubject.subjectId}`}
+                  </div>
+                ) : (
+                  <div className="px-2.5 py-0.5 rounded bg-[#062419] border border-[#10b981]/40 text-[10px] font-bold uppercase text-[#10b981]">
+                    MONITORING // ZERO ACTIVE ALERTS
+                  </div>
+                )}
+              </div>
+
+              {/* Main Live Video Stream Stage (Fixed Size & Aspect-Ratio Locked — Never Zooms) */}
+              <div className="relative my-2 flex-1 min-h-0 bg-[#08090c] border border-[#1e222d] rounded overflow-hidden flex items-center justify-center">
+                {/* Tactical Corner Reticle Brackets */}
+                <div className="absolute top-3 left-3 w-4 h-4 border-t-2 border-l-2 border-[#52525b] pointer-events-none z-20" />
+                <div className="absolute top-3 right-3 w-4 h-4 border-t-2 border-r-2 border-[#52525b] pointer-events-none z-20" />
+                <div className="absolute bottom-3 left-3 w-4 h-4 border-b-2 border-l-2 border-[#52525b] pointer-events-none z-20" />
+                <div className="absolute bottom-3 right-3 w-4 h-4 border-b-2 border-r-2 border-[#52525b] pointer-events-none z-20" />
+
+                {/* Top-Left Tactical HUD Telemetry Overlay */}
+                <div className="absolute top-4 left-4 z-20 pointer-events-none space-y-0.5 text-[10px] tracking-wider uppercase bg-[#090a0d]/80 px-2.5 py-1.5 rounded border border-[#222631]">
+                  <div className="text-white font-bold">CAM 01 // ZERO-SHOT VIDEO STREAM</div>
+                  <div className="text-[#71717a]">
+                    MODEL: LIQUIDAI/d1-3B // CROP PADDING: +{Math.round(paddingRatio * 100)}%
+                  </div>
+                  <div className="text-[#71717a]">
+                    ACTIVE RULE: <span className="text-[#e4e4e7]">{activeRule}</span>
+                  </div>
+                </div>
+
+                {/* Locked 16:9 Coordinate Frame so Video and Overlay Canvas Never Shift or Zoom */}
+                <div className="relative w-full h-full max-w-full max-h-full aspect-video flex items-center justify-center overflow-hidden">
+                  <canvas
+                    ref={wsCanvasRef}
+                    className="w-full h-full object-contain"
+                  />
+
+                  <canvas
+                    ref={overlayCanvasRef}
+                    width={1280}
+                    height={720}
+                    className="absolute inset-0 w-full h-full object-contain pointer-events-none z-10"
+                  />
+                </div>
+
+                {!wsConnected && (
+                  <div className="absolute inset-0 z-10 flex flex-col items-center justify-center text-center p-6 max-w-md mx-auto space-y-3">
+                    <Camera className="w-10 h-10 text-[#52525b] mx-auto" />
+                    <div className="text-xs font-bold uppercase tracking-wider text-white">
+                      WAITING FOR EDGE ANALYTICS SERVER
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Viewport Bottom Action Bar */}
+              <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#222631] text-[11px]">
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-[#10b981]" />
+                  <span className="text-[#71717a]">BYTETRACK:</span>
+                  <span className="text-[#10b981] font-bold">ENGAGED</span>
+                  <span className="text-[#52525b]">|</span>
+                  <span className="text-[#a1a1aa]">
+                    YELLOW = UNVERIFIED ALERT • RED = VERIFIED SUBJECT
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setShowPaddedOverlay((p) => !p)}
+                    className="px-2.5 py-1 rounded bg-[#14171f] hover:bg-[#1e222d] border border-[#2d3242] text-[#a1a1aa] hover:text-white text-[10px] font-bold uppercase flex items-center gap-1"
+                  >
+                    {showPaddedOverlay ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                    {showPaddedOverlay ? 'HIDE PADDED CROP' : 'SHOW PADDED CROP'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT COLUMN (3 cols): SCROLLABLE FLAGGED SUBJECT // INCIDENT DOSSIER */}
+          <div className="lg:col-span-3 h-full min-h-0 flex flex-col overflow-hidden">
+            <div className="bg-[#111318] border border-[#222631] rounded p-3 flex flex-col h-full min-h-0 overflow-hidden">
+              {selectedSubject ? (
+                <>
+                  {/* Fixed Dossier Header */}
+                  <div className="shrink-0 flex items-center justify-between border-b border-[#222631] pb-2 mb-2.5">
+                    <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-white">
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          selectedSubject.status === 'verified' ? 'bg-[#ef4444]' : 'bg-[#eab308]'
+                        }`}
+                      />
+                      <span>FLAGGED SUBJECT // DOSSIER</span>
+                    </div>
+                    <span
+                      className={`px-2 py-0.5 rounded border text-[9px] font-bold uppercase ${
+                        selectedSubject.status === 'verified'
+                          ? 'bg-[#2a0a0e] border-[#dc2626] text-[#ef4444]'
+                          : 'bg-[#281b05] border-[#eab308] text-[#eab308]'
+                      }`}
+                    >
+                      {selectedSubject.status === 'verified' ? 'VERIFIED' : 'REVIEW REQ'}
+                    </span>
+                  </div>
+
+                  {/* Internally Scrollable Dossier Body (Prevents UI Height Expansion) */}
+                  <div className="flex-1 min-h-0 overflow-y-auto pr-1 space-y-3 tactical-scroll">
+                    {/* Captured Incident Frame Preview Box */}
+                    <div className="relative h-40 bg-[#08090c] border border-[#222631] rounded overflow-hidden flex items-center justify-center">
+                      {currentFrame ? (
+                        <img
+                          src={currentFrame.cropB64}
+                          alt="Subject Crop"
+                          className="w-full h-full object-contain"
+                        />
+                      ) : (
+                        <span className="text-[10px] text-[#71717a]">CAPTURING 10 INCIDENT FRAMES...</span>
+                      )}
+
+                      <span
+                        className={`absolute top-2 right-2 px-2 py-0.5 rounded text-[10px] font-bold ${
+                          selectedSubject.status === 'verified'
+                            ? 'bg-[#2a0a0e] border border-[#dc2626] text-[#ef4444]'
+                            : 'bg-[#281b05] border border-[#eab308] text-[#eab308]'
+                        }`}
+                      >
+                        MATCH: {(selectedSubject.peakConfidence * 100).toFixed(1)}%
+                      </span>
+
+                      <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between">
+                        <span className="px-2 py-0.5 rounded bg-[#111318]/90 border border-[#2d3242] text-[10px] text-white font-bold">
+                          FRAME #{String(selectedFrameIdx + 1).padStart(2, '0')} OF{' '}
+                          {String(activeFrames.length || 10).padStart(2, '0')}
+                        </span>
+
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedFrameIdx((i) => Math.max(0, i - 1))}
+                            className="p-1 rounded bg-[#111318]/90 border border-[#2d3242] text-white hover:bg-[#1e222d]"
+                          >
+                            <ChevronLeft className="w-3 h-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSelectedFrameIdx((i) =>
+                                Math.min(Math.max(0, activeFrames.length - 1), i + 1)
+                              )
+                            }
+                            className="p-1 rounded bg-[#111318]/90 border border-[#2d3242] text-white hover:bg-[#1e222d]"
+                          >
+                            <ChevronRight className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Mini 10-Frame Thumbnail Scrubber */}
+                    <div>
+                      <div className="flex items-center justify-between text-[10px] text-[#a1a1aa] mb-1">
+                        <span>INCIDENT CAPTURE WINDOW (10 FRAMES):</span>
+                        <button
+                          type="button"
+                          onClick={() => setActiveView('incidents')}
+                          className="text-[#eab308] hover:underline font-bold"
+                        >
+                          OPEN FULL REPLAY →
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-5 gap-1">
+                        {activeFrames.slice(0, 10).map((f, idx) => (
+                          <button
+                            key={f.frameId}
+                            type="button"
+                            onClick={() => setSelectedFrameIdx(idx)}
+                            className={`h-9 rounded overflow-hidden border relative ${
+                              idx === selectedFrameIdx
+                                ? 'border-[#ef4444] ring-1 ring-[#ef4444]'
+                                : 'border-[#262b38] opacity-70 hover:opacity-100'
+                            }`}
+                          >
+                            <img src={f.cropB64} alt={f.frameId} className="w-full h-full object-cover" />
+                            <span className="absolute bottom-0 right-0 bg-black/80 text-[8px] px-1 text-white">
+                              #{idx + 1}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Key-Value Telemetry Rows */}
+                    <div className="space-y-1.5 text-[11px] pt-1">
+                      <div className="flex justify-between items-start border-b border-[#1d212b] pb-1.5 gap-2">
+                        <span className="text-[#71717a] uppercase">TRIGGERED RULE:</span>
+                        <span className="text-[#ef4444] font-bold text-right truncate max-w-[180px]">
+                          {selectedSubject.detectionRule}
+                        </span>
+                      </div>
+
+                      <div className="flex justify-between items-center border-b border-[#1d212b] pb-1.5">
+                        <span className="text-[#71717a] uppercase">MATCH CONFIDENCE:</span>
+                        <span className="text-[#10b981] font-bold">
+                          {(selectedSubject.peakConfidence * 100).toFixed(1)}% (HIGH)
+                        </span>
+                      </div>
+
+                      <div className="flex justify-between items-center border-b border-[#1d212b] pb-1.5">
+                        <span className="text-[#71717a] uppercase">CAMERA // TRACK ID:</span>
+                        <span className="text-white font-bold">
+                          {selectedSubject.camerasSeen.join(' → ')} (#{selectedSubject.trackId})
+                        </span>
+                      </div>
+
+                      <div className="flex justify-between items-center border-b border-[#1d212b] pb-1.5">
+                        <span className="text-[#71717a] uppercase">BOUNDING BOX STATE:</span>
+                        <span
+                          className={`font-bold uppercase ${
+                            selectedSubject.status === 'verified' ? 'text-[#ef4444]' : 'text-[#eab308]'
+                          }`}
+                        >
+                          {selectedSubject.status === 'verified'
+                            ? 'RED [VERIFIED SUBJECT]'
+                            : 'YELLOW [UNVERIFIED ALERT]'}
+                        </span>
+                      </div>
+
+                      <div className="flex justify-between items-center border-b border-[#1d212b] pb-1.5">
+                        <span className="text-[#71717a] uppercase">LANCEDB EMBEDDING:</span>
+                        <span className="text-white font-bold">
+                          {selectedSubject.status === 'verified'
+                            ? 'LOCKED [PERMANENT]'
+                            : `TTL: ${Math.max(0, ((selectedSubject.expiresAt || nowMs) - nowMs) / 1000).toFixed(1)}s`}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* // LANCEDB & ARCFACE VECTOR BOX */}
+                    <div className="bg-[#0b0d12] border border-[#222631] rounded p-2.5 space-y-1">
+                      <div className="text-[10px] font-bold text-white uppercase">
+                        // 512-D ARCFACE R50 VECTOR (BUFFALO_L / LANCEDB)
+                      </div>
+                      <p className="text-[10px] text-[#9ca3af] font-mono break-all">
+                        {selectedSubject.hasFaceEmbedding ? '512-D EMBEDDING STORED' : 'NO FACE EMBEDDED'}
+                      </p>
+                      <p className="text-[10px] text-[#71717a] font-sans">
+                        Only unverified and verified flagged subjects are stored in LanceDB. Unverified vectors are automatically purged when the verification timer expires.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Pinned Bottom Verify / Dismiss Buttons */}
+                  <div className="shrink-0 space-y-1.5 pt-2.5 mt-2 border-t border-[#222631]">
+                    {selectedSubject.status === 'unverified' ? (
+                      <button
+                        type="button"
+                        onClick={() => handleVerifySubject(selectedSubject.subjectId)}
+                        className="w-full py-2 rounded bg-[#dc2626] hover:bg-[#ef4444] text-white font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 shadow-lg transition"
+                      >
+                        <Check className="w-4 h-4" />
+                        VERIFY SUBJECT (TURN BOX RED)
+                      </button>
+                    ) : (
+                      <div className="w-full py-2 rounded bg-[#2a0a0e] border border-[#dc2626] text-[#fca5a5] font-bold text-xs uppercase tracking-wider text-center">
+                        ✓ VERIFIED — RED BOUNDING BOX ACTIVE
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => handleDismissSubject(selectedSubject.subjectId)}
+                      className="w-full py-1.5 rounded bg-[#14171f] hover:bg-[#1f2430] border border-[#2d3242] text-[#d4d4d8] font-bold text-xs uppercase tracking-wider transition"
+                    >
+                      DISMISS ALERT & PURGE VECTOR
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="my-auto text-center p-6 space-y-3">
+                  <ShieldAlert className="w-10 h-10 text-[#52525b] mx-auto" />
+                  <div className="text-xs font-bold uppercase text-white">NO FLAGGED SUBJECT SELECTED</div>
+                  <p className="text-[11px] text-[#71717a] font-sans">
+                    When LiquidAI/d1-3B detects a match above your confidence threshold ({Math.round(threshold * 100)}%), the subject is outlined in <strong className="text-[#eab308]">Yellow</strong> on the live stream and 10 incident frames appear here for operator verification.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        </main>
+      ) : (
+        /* =====================================================================
+           VIEW 2: INCIDENT FRAMES & LANCEDB AUDIT (LOCKED HEIGHT & SCROLLABLE)
+        ===================================================================== */
+        <main className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-3 p-3 overflow-hidden">
+          {/* LEFT COLUMN (4 cols): SCROLLABLE INCIDENT LOGS & DATABASE FILTER */}
+          <div className="lg:col-span-4 bg-[#111318] border border-[#222631] rounded p-3 flex flex-col gap-3 h-full min-h-0 overflow-hidden">
+            <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 border-b border-[#222631] pb-2">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold uppercase tracking-wider text-white">INCIDENT LOGS</span>
+                <span className="px-2 py-0.5 rounded bg-[#181b24] border border-[#2d3242] text-[10px] text-[#a1a1aa]">
+                  {unverifiedList.length} Pending Review
+                </span>
+              </div>
+
+              <div className="flex flex-wrap gap-1 text-[10px]">
+                {['ALL', 'UNVERIFIED', 'VERIFIED', 'LANCEDB'].map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    onClick={() => setIncidentFilter(f)}
+                    className={`px-2 py-0.5 rounded border uppercase transition ${
+                      incidentFilter === f
+                        ? 'bg-[#281b05] border-[#eab308] text-[#fde047] font-bold'
+                        : 'bg-[#0b0d12] border-[#232732] text-[#71717a] hover:text-white'
+                    }`}
+                  >
+                    {f}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {incidentFilter === 'LANCEDB' ? (
+              <div className="flex-1 min-h-0 space-y-2 overflow-y-auto pr-1 tactical-scroll">
+                <div className="text-[10px] text-[#a1a1aa] uppercase font-bold">
+                  LANCEDB TABLE: subject_embeddings ({allSubjectsList.length} VECTORS)
+                </div>
+                {allSubjectsList.length === 0 ? (
+                  <div className="p-4 border border-dashed border-[#262b38] rounded text-center text-xs text-[#71717a]">
+                    LanceDB vector store is empty. Normal tracks are never stored.
+                  </div>
+                ) : (
+                  allSubjectsList.map((s) => (
+                    <div key={s.subjectId} className="p-3 rounded bg-[#0b0d12] border border-[#262b38] space-y-1.5 text-xs">
+                      <div className="flex justify-between items-center">
+                        <span className="font-bold text-white">{s.subjectId}</span>
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                            s.status === 'verified'
+                              ? 'bg-[#2a0a0e] text-[#ef4444] border border-[#dc2626]'
+                              : 'bg-[#281b05] text-[#eab308] border border-[#eab308]'
+                          }`}
+                        >
+                          {s.status}
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-[#9ca3af] font-mono">
+                        VECTOR: {s.hasFaceEmbedding ? '512-D EMBEDDING STORED' : 'NO FACE EMBEDDED'}
+                      </div>
+                      <div className="flex justify-between items-center text-[10px] text-[#71717a] pt-1 border-t border-[#1d212b]">
+                        <span>
+                          {s.status === 'verified'
+                            ? 'TTL: PERMANENT (VERIFIED)'
+                            : `TTL: ${Math.max(0, ((s.expiresAt || nowMs) - nowMs) / 1000).toFixed(1)}s`}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleDismissSubject(s.subjectId)}
+                          className="text-[#ef4444] hover:underline flex items-center gap-1"
+                        >
+                          <Trash2 className="w-3 h-3" /> PURGE VECTOR
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            ) : (
+              <div className="flex-1 min-h-0 space-y-2.5 overflow-y-auto pr-1 tactical-scroll">
+                {allSubjectsList
+                  .filter((s) =>
+                    incidentFilter === 'ALL'
+                      ? true
+                      : incidentFilter === 'UNVERIFIED'
+                      ? s.status === 'unverified'
+                      : s.status === 'verified'
+                  )
+                  .map((s) => {
+                    const isSelected = selectedSubject && selectedSubject.subjectId === s.subjectId;
+                    const isUnverified = s.status === 'unverified';
+                    return (
+                      <div
+                        key={s.subjectId}
+                        onClick={() => {
+                          setSelectedSubjectId(s.subjectId);
+                          setSelectedFrameIdx(0);
+                        }}
+                        className={`cursor-pointer p-3 rounded border transition relative ${
+                          isSelected
+                            ? 'bg-[#14171f] border-white shadow-lg'
+                            : 'bg-[#0b0d12] border-[#222631] hover:border-[#3f3f46]'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-xs font-bold text-[#ef4444] flex items-center gap-1.5">
+                            <span
+                              className={`w-2 h-2 rounded-full ${
+                                isUnverified ? 'bg-[#eab308]' : 'bg-[#ef4444]'
+                              }`}
+                            />
+                            SUBJECT #{s.subjectId}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[9px] font-extrabold uppercase ${
+                              isUnverified
+                                ? 'bg-[#f59e0b] text-black'
+                                : 'bg-[#1f2430] border border-[#3f3f46] text-white'
+                            }`}
+                          >
+                            {isUnverified ? 'PENDING VERIFICATION' : 'VERIFIED'}
+                          </span>
+                        </div>
+
+                        <p className="text-xs text-white font-sans mb-2">{s.detectionRule}</p>
+
+                        <div className="grid grid-cols-2 gap-2 bg-[#090a0d] border border-[#1d212b] p-2 rounded text-[10px]">
+                          <div>
+                            <div className="text-[#71717a]">MATCH PROBABILITY</div>
+                            <div className="text-white font-bold text-xs mt-0.5">
+                              {s.peakConfidence.toFixed(2)} (HIGH)
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[#71717a]">CONFIDENCE SCORE</div>
+                            <div className="text-[#10b981] font-bold text-xs mt-0.5">
+                              {(s.peakConfidence * 100).toFixed(1)}%
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between text-[10px] text-[#71717a] mt-2 pt-1.5 border-t border-[#1d212b]">
+                          <span className="text-white font-bold">
+                            • {isUnverified ? 'YELLOW BOX ON STREAM' : 'RED BOX ON STREAM'}
+                          </span>
+                          <span>{s.frames.length} / 10 INCIDENT FRAMES</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                {allSubjectsList.length === 0 && (
+                  <div className="p-6 border border-dashed border-[#262b38] rounded text-center text-xs text-[#71717a]">
+                    No incidents logged yet.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* RIGHT COLUMN (8 cols): 10-FRAME FORENSIC REPLAY & VERIFICATION BAR */}
+          <div className="lg:col-span-8 bg-[#111318] border border-[#222631] rounded p-3 flex flex-col justify-between h-full min-h-0 overflow-hidden">
+            {/* Top Replay Header */}
+            <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 border-b border-[#222631] pb-2">
+              <div className="text-xs font-bold uppercase tracking-wider text-white">
+                FRAMES FORENSIC REPLAY //{' '}
+                <span className="text-[#71717a]">
+                  {selectedSubject ? `${selectedSubject.subjectId}-CAM01` : 'NO SUBJECT'}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-3 text-xs">
+                <div className="flex rounded overflow-hidden border border-[#2d3242] text-[10px]">
+                  <button
+                    type="button"
+                    onClick={() => setReplayViewMode('full')}
+                    className={`px-2 py-0.5 font-bold uppercase ${
+                      replayViewMode === 'full' ? 'bg-white text-black' : 'bg-[#0b0d12] text-[#a1a1aa]'
+                    }`}
+                  >
+                    SCENE FRAME (WITH BBOX)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setReplayViewMode('crop')}
+                    className={`px-2 py-0.5 font-bold uppercase ${
+                      replayViewMode === 'crop' ? 'bg-white text-black' : 'bg-[#0b0d12] text-[#a1a1aa]'
+                    }`}
+                  >
+                    PADDED CROP (WITH BBOX)
+                  </button>
+                </div>
+
+                <span className="text-[#ef4444] font-bold uppercase">
+                  ● INCIDENT FRAME #{String(selectedFrameIdx + 1).padStart(2, '0')} OF{' '}
+                  {String(activeFrames.length || 10).padStart(2, '0')}
+                </span>
+              </div>
+            </div>
+
+            {/* Center Frame Replay Display (Locked Flex Container) */}
+            <div className="relative my-2 flex-1 min-h-0 bg-[#08090c] border border-[#1e222d] rounded overflow-hidden flex items-center justify-center">
+              <div className="absolute top-3 left-3 w-4 h-4 border-t-2 border-l-2 border-[#52525b] pointer-events-none z-20" />
+              <div className="absolute top-3 right-3 w-4 h-4 border-t-2 border-r-2 border-[#52525b] pointer-events-none z-20" />
+              <div className="absolute bottom-3 left-3 w-4 h-4 border-b-2 border-l-2 border-[#52525b] pointer-events-none z-20" />
+              <div className="absolute bottom-3 right-3 w-4 h-4 border-b-2 border-r-2 border-[#52525b] pointer-events-none z-20" />
+
+              {currentFrame ? (
+                <>
+                  <img
+                    src={replayViewMode === 'crop' ? currentFrame.cropB64 : currentFrame.fullFrameB64}
+                    alt={currentFrame.frameId}
+                    className="w-full h-full object-contain"
+                  />
+                  <div className="absolute top-4 left-4 bg-[#090a0d]/85 border border-[#262b38] px-2.5 py-1.5 rounded text-[10px] space-y-0.5">
+                    <div className="text-white font-bold">
+                      {selectedSubject.subjectId} // {currentFrame.frameId} (t = +{currentFrame.relSeconds}s)
+                    </div>
+                    <div className="text-[#a1a1aa]">
+                      DETECTION RULE: {selectedSubject.detectionRule}
+                    </div>
+                  </div>
+                  <div
+                    className={`absolute top-4 right-4 px-2.5 py-1 rounded border text-[10px] font-bold uppercase ${
+                      selectedSubject.status === 'verified'
+                        ? 'bg-[#2a0a0e] border-[#dc2626] text-[#ef4444]'
+                        : 'bg-[#281b05] border-[#eab308] text-[#eab308]'
+                    }`}
+                  >
+                    MATCH: {(currentFrame.matchProb * 100).toFixed(1)}% //{' '}
+                    {selectedSubject.status.toUpperCase()}
+                  </div>
+                </>
+              ) : (
+                <div className="text-xs text-[#71717a] uppercase">
+                  NO INCIDENT FRAMES SELECTED
+                </div>
+              )}
+            </div>
+
+            {/* 10-Frame Sequence Buffer Strip */}
+            <div className="shrink-0 bg-[#0b0d12] border border-[#222631] rounded p-2">
+              <div className="flex items-center justify-between text-[10px] text-[#a1a1aa] uppercase mb-1.5">
+                <span>INCIDENT CAPTURE SEQUENCE BUFFER [10 FRAMES WITH THIN BOUNDING BOX]</span>
+                <span>CAPTURE INTERVAL: 120ms // 10 FRAMES MAX</span>
+              </div>
+
+              <div className="grid grid-cols-5 sm:grid-cols-10 gap-1.5">
+                {activeFrames.slice(0, 10).map((f, idx) => {
+                  const isActive = idx === selectedFrameIdx;
+                  return (
+                    <div
+                      key={f.frameId}
+                      onClick={() => setSelectedFrameIdx(idx)}
+                      className={`cursor-pointer rounded border p-1 flex flex-col justify-between transition relative ${
+                        isActive
+                          ? 'bg-[#1a0d10] border-[#ef4444] ring-1 ring-[#ef4444]'
+                          : 'bg-[#111318] border-[#232732] opacity-75 hover:opacity-100'
+                      }`}
+                    >
+                      <img
+                        src={f.fullFrameB64 || f.cropB64}
+                        alt={f.frameId}
+                        className="w-full h-11 object-cover rounded-sm"
+                      />
+                      <div className="flex items-center justify-between text-[9px] mt-1">
+                        <span className="text-white font-bold">#{idx + 1}</span>
+                        <span className={isActive ? 'text-[#ef4444] font-bold' : 'text-[#71717a]'}>
+                          +{f.relSeconds}s
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Bottom Replay Controls & Verify/Dismiss Bar */}
+            <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 pt-2.5 mt-2 border-t border-[#222631]">
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setSelectedFrameIdx((i) => Math.max(0, i - 1))}
+                  className="px-3 py-1.5 rounded bg-[#14171f] hover:bg-[#1e222d] border border-[#2d3242] text-white text-xs font-bold uppercase flex items-center gap-1"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" /> PREVIOUS
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsPlayingReplay((p) => !p)}
+                  className="px-3 py-1.5 rounded bg-[#14171f] hover:bg-[#1e222d] border border-[#2d3242] text-white text-xs font-bold uppercase flex items-center gap-1"
+                >
+                  {isPlayingReplay ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSelectedFrameIdx((i) => Math.min(Math.max(0, activeFrames.length - 1), i + 1))
+                  }
+                  className="px-3 py-1.5 rounded bg-[#14171f] hover:bg-[#1e222d] border border-[#2d3242] text-white text-xs font-bold uppercase flex items-center gap-1"
+                >
+                  NEXT <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {selectedSubject && (
+                <div className="flex items-center gap-2">
+                  {selectedSubject.status === 'unverified' && (
+                    <button
+                      type="button"
+                      onClick={() => handleVerifySubject(selectedSubject.subjectId)}
+                      className="px-4 py-1.5 rounded bg-[#dc2626] hover:bg-[#ef4444] text-white font-bold text-xs uppercase tracking-wider flex items-center gap-1.5 shadow-lg transition"
+                    >
+                      <Check className="w-3.5 h-3.5" /> VERIFY SUBJECT (RED BOX)
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => handleDismissSubject(selectedSubject.subjectId)}
+                    className="px-3.5 py-1.5 rounded bg-[#14171f] hover:bg-[#1e222d] border border-[#2d3242] text-[#d4d4d8] font-bold text-xs uppercase tracking-wider flex items-center gap-1 transition"
+                  >
+                    <X className="w-3.5 h-3.5" /> DISMISS ALERT
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </main>
+      )}
+
+      {/* =====================================================================
+          BOTTOM NAVIGATION & PIPELINE TELEMETRY FOOTER (FIXED HEIGHT)
+      ===================================================================== */}
+      <footer className="shrink-0 bg-[#0d0f13] border-t border-[#222631] px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setActiveView('dashboard')}
+            className={`px-3.5 py-1.5 rounded font-bold uppercase tracking-wider flex items-center gap-1.5 text-xs transition ${
+              activeView === 'dashboard'
+                ? 'bg-white text-[#090a0d]'
+                : 'bg-[#14171f] text-[#a1a1aa] hover:text-white border border-[#262b38]'
+            }`}
+          >
+            <LayoutGrid className="w-3.5 h-3.5" />
+            DASHBOARD
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveView('incidents')}
+            className={`px-3.5 py-1.5 rounded font-bold uppercase tracking-wider flex items-center gap-1.5 text-xs transition ${
+              activeView === 'incidents'
+                ? 'bg-white text-[#090a0d]'
+                : 'bg-[#14171f] text-[#a1a1aa] hover:text-white border border-[#262b38]'
+            }`}
+          >
+            <FileText className="w-3.5 h-3.5" />
+            INCIDENT FRAMES & LANCEDB
+            {unverifiedList.length > 0 && (
+              <span className="w-2 h-2 rounded-full bg-[#ef4444]" />
+            )}
+          </button>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-4 text-[10px] text-[#71717a] uppercase">
+          <div className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-[#10b981]" />
+            <span>d1-3B LATENCY:</span>
+            <strong className="text-white">{vlmLatencyMs}ms</strong>
+          </div>
+          <div>
+            <span>INCIDENT BUFFER:</span>{' '}
+            <strong className="text-[#10b981]">10 FRAMES / ALERT</strong>
+          </div>
+          <div>
+            <span>VECTOR STORE:</span>{' '}
+            <strong className="text-white">LANCEDB ({allSubjectsList.length} ACTIVE)</strong>
+          </div>
+          <div>
+            <span>INCIDENT ARCHIVE:</span>{' '}
+            <strong className="text-white">{incidentArchive.length} VERIFIED</strong>
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+}
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+  </script>
+</body>
+</html>

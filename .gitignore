@@ -1,0 +1,6 @@
+data/
+test/
+__pycache__/
+yolo26s.pt
+pipeline/__pycache__
+.venv
