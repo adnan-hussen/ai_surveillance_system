@@ -23,7 +23,7 @@ class PipelineConfig:
 
     # --- 2. System-One Decision Model (LiquidAI/d1-3B) ---
     decision_model_id: str = os.getenv("DECISION_MODEL_ID", "LiquidAI/d1-3B")
-    decision_input_side: int = 384  # Optimal latency/accuracy trade-off (~156ms median on d1-3B per benchmark)
+    # decision_input_side: int = 384
     compile_decision_model: bool = False
     default_detection_rule: str = "Is the person in the frame smoking?"
     decision_threshold: float = float(os.getenv("DECISION_THRESHOLD", "0.65"))  # Positive match probability threshold

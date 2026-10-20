@@ -90,7 +90,7 @@ class DecisionModelEngine:
         """
         t0 = time.perf_counter()
         img = image.convert("RGB")
-        img.thumbnail((self.config.decision_input_side, self.config.decision_input_side))
+        # img.thumbnail((self.config.decision_input_side, self.config.decision_input_side))
 
         import torch
 
