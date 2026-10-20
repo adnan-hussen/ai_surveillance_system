@@ -549,7 +549,7 @@ def main() -> int:
     parser.add_argument("--padding-ratio", type=float, default=0.35, help="Context padding ratio around subject bbox")
     parser.add_argument("--threshold", type=float, default=0.65, help="Positive match probability threshold")
     parser.add_argument("--timeout", type=float, default=45.0, help="Seconds before unverified subject expires from LanceDB")
-    parser.add_argument("--webcam", action="store_true", help="Use local MacBook / USB webcam (index 0) as CAM-01")
+    parser.add_argument("--source", type=str, default = "0", help="Select camera souce")
     args = parser.parse_args()
 
     cfg = PipelineConfig(
@@ -560,8 +560,10 @@ def main() -> int:
         decision_threshold=args.threshold,
         verification_timeout_sec=args.timeout,
     )
-    if args.webcam:
+    if args.source == "0":
         cfg.camera_sources["CAM-01 (Primary Feed)"] = 0
+    else:
+        cfg.camera_sources["CAM-01 (Primary Feed)"] = f"{args.source}"
 
     orchestrator = SurveillancePipelineOrchestrator(cfg)
     orchestrator.start()
