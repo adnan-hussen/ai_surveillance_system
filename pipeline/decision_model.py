@@ -73,14 +73,8 @@ class DecisionModelEngine:
             self.model.compile(mode="reduce-overhead")
 
         self.engine = getattr(self.model, "engine", None)
-        self._warmup_sync()
         logger.info("LiquidAI/d1-3B System-One engine ready.")
 
-    def _warmup_sync(self) -> None:
-        """Warms up kernel selection / CUDA graphs on standard crop sizes."""
-        warm_img = Image.new("RGB", (self.config.decision_input_side, self.config.decision_input_side), (120, 120, 120))
-        rule_spec = {"type": "noul", "instructions": self.config.default_detection_rule}
-        self._infer_sync(warm_img, rule_spec, state={"camera": "warmup"})
 
     def _infer_sync(self, image: Image.Image, rule_spec: dict, state: dict | None = None) -> tuple[float, float, float]:
         """Executes a single forward pass without token generation.
