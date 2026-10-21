@@ -2,7 +2,7 @@
 
 Edge Compute and Client-side video analytics pipeline powered by **LiquidAI `d1-3B`** (System-One decision model), **Ultralytics YOLO26s**, **ByteTrack**, **InsightFace `buffalo_l`** (SCRFD-10GF detector + ArcFace ResNet-50 recognizer), and **LanceDB**.
 
-![](./assets/screenshot.png)
+![Screenshot](./assets/screenshot.png)
 
 ## Architecture & Workflow
 
