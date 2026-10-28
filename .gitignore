@@ -5,3 +5,4 @@ yolo26s.pt
 pipeline/__pycache__
 .venv
 .DS_Store
+.env

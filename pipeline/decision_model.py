@@ -16,7 +16,7 @@ def _select_d1_dtype(torch_mod, device: str):
     if device == "cpu":
         return torch_mod.float32
     if device == "mps":
-        # Apple Silicon (M1/M2/M3/M4) runs LiquidAI/d1-3B in bfloat16 on MPS
+        # Apple Silicon (M1/M2/M3/M4)
         return torch_mod.bfloat16
     if device == "cuda" and torch_mod.cuda.get_device_capability()[0] >= 8:
         return torch_mod.bfloat16

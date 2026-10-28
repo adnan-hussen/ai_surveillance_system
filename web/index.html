@@ -1039,15 +1039,15 @@ function App() {
                       </div>
 
                       <div className="flex justify-between items-center border-b border-[#1d212b] pb-1.5">
-                        <span className="text-[#71717a] uppercase">BOUNDING BOX STATE:</span>
+                        <span className="text-[#71717a] uppercase">ALERT STATE:</span>
                         <span
                           className={`font-bold uppercase ${
                             selectedSubject.status === 'verified' ? 'text-[#ef4444]' : 'text-[#eab308]'
                           }`}
                         >
                           {selectedSubject.status === 'verified'
-                            ? 'RED [VERIFIED SUBJECT]'
-                            : 'YELLOW [UNVERIFIED ALERT]'}
+                            ? 'VERIFIED SUBJECT'
+                            : 'UNVERIFIED ALERT'}
                         </span>
                       </div>
 
@@ -1082,11 +1082,11 @@ function App() {
                         className="w-full py-2 rounded bg-[#dc2626] hover:bg-[#ef4444] text-white font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 shadow-lg transition"
                       >
                         <Check className="w-4 h-4" />
-                        VERIFY SUBJECT (TURN BOX RED)
+                        VERIFY SUBJECT
                       </button>
                     ) : (
                       <div className="w-full py-2 rounded bg-[#2a0a0e] border border-[#dc2626] text-[#fca5a5] font-bold text-xs uppercase tracking-wider text-center">
-                        ✓ VERIFIED — RED BOUNDING BOX ACTIVE
+                        ✓ VERIFIED
                       </div>
                     )}
 
@@ -1095,7 +1095,7 @@ function App() {
                       onClick={() => handleDismissSubject(selectedSubject.subjectId)}
                       className="w-full py-1.5 rounded bg-[#14171f] hover:bg-[#1f2430] border border-[#2d3242] text-[#d4d4d8] font-bold text-xs uppercase tracking-wider transition"
                     >
-                      DISMISS ALERT & PURGE VECTOR
+                      DISMISS ALERT
                     </button>
                   </div>
                 </>
@@ -1274,7 +1274,7 @@ function App() {
             {/* Top Replay Header */}
             <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 border-b border-[#222631] pb-2">
               <div className="text-xs font-bold uppercase tracking-wider text-white">
-                FRAMES FORENSIC REPLAY //{' '}
+                {' '}
                 <span className="text-[#71717a]">
                   {selectedSubject ? `${selectedSubject.subjectId}-CAM01` : 'NO SUBJECT'}
                 </span>

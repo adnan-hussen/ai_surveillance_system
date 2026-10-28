@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
-"""Edge Compute Video Analytics & Security Surveillance Server.
 
-Orchestrates:
-  1. Real-time multi-camera video ingestion (RTSP / USB / built-in webcam / video file)
-  2. Person Detection & Multi-Object Tracking (Ultralytics YOLO26s + ByteTrack)
-  3. Context-padded subject cropping (configurable padding ratio around person bbox)
-  4. System-One Multimodal Decision Model (`LiquidAI/d1-3B`) single-pass detection rule evaluation
-  5. Face Detection & 512-D Biometric Embedding (`InsightFace buffalo_l`: SCRFD + ArcFace ResNet-50)
-  6. Vector Database (`LanceDB`) for unverified/verified subject Re-ID across cameras & TTL purge
-  7. Event Service & RFC 6455 WebSocket + HTTP REST API for the React Security Operations Console
-
-Usage:
-    python server.py --webcam                 # Stream local MacBook / USB camera at 30 FPS
-    python server.py --compile                # Enable CUDA graphs for d1-3B
-    python server.py --host 0.0.0.0 --port 8000
-"""
 
 from __future__ import annotations
 
