@@ -25,7 +25,7 @@ from config import PipelineConfig
 from pipeline.decision_model import DecisionModelEngine
 from pipeline.detector_tracker import PersonDetectorTracker
 from pipeline.event_service import EventService, bgr_to_b64_jpeg
-from pipeline.face_embedder import FaceDetectorEmbedder
+from pipeline.reid_embedder import PersonReIDEmbedder
 from pipeline.schemas import TrackedSubject
 from pipeline.vector_db import SubjectVectorDB
 
@@ -168,7 +168,7 @@ class SurveillancePipelineOrchestrator:
         )
         self.detector_tracker = PersonDetectorTracker(config)
         self.decision_model = DecisionModelEngine(config)
-        self.face_embedder = FaceDetectorEmbedder(config)
+        self.reid_embedder = PersonReIDEmbedder(config)
 
         self._running = False
         self._threads: list[threading.Thread] = []
@@ -179,7 +179,7 @@ class SurveillancePipelineOrchestrator:
     def start(self) -> None:
         """Loads models and starts camera processing threads + LanceDB TTL reaper thread."""
         self.decision_model.load()
-        self.face_embedder.load()
+        self.reid_embedder.load()
         self._running = True
 
         # Start TTL cleanup thread for expiring unverified subjects in LanceDB
@@ -287,11 +287,12 @@ class SurveillancePipelineOrchestrator:
             existing_subject = self.event_service.resolve_existing_subject_for_track(camera_id, track_id)
             subject_rec = existing_subject
             reid_sim = None
-            face_detected = False
+
+            # Extract 512-D Full-Body Person Re-ID embedding directly from YOLO person crop
+            body_emb, body_pil = self.reid_embedder.embed_person_crop(tight_bgr)
+            has_reid = body_emb is not None
 
             if is_triggered or existing_subject is not None:
-                face_emb, face_pil, _ = self.face_embedder.detect_and_embed(tight_bgr)
-                face_detected = face_emb is not None
                 subject_rec, _, reid_sim = self.event_service.register_or_update_subject(
                     camera_id=camera_id,
                     track_id=track_id,
@@ -299,26 +300,23 @@ class SurveillancePipelineOrchestrator:
                     match_probability=match_prob,
                     padded_crop_pil=padded_pil,
                     full_frame_bgr=frame_bgr,
-                    face_embedding=face_emb,
-                    face_pil=face_pil,
+                    face_embedding=body_emb,
+                    face_pil=body_pil,
                 )
-            elif len(self.event_service.flagged_subjects) > 0:
+            elif len(self.event_service.flagged_subjects) > 0 and has_reid:
                 # Cross-camera Re-ID check against active watchlist in LanceDB
-                face_emb, face_pil, _ = self.face_embedder.detect_and_embed(tight_bgr)
-                if face_emb is not None:
-                    matched_row, sim = self.vector_db.search_matching_subject(face_emb, now=now)
-                    if matched_row is not None:
-                        face_detected = True
-                        subject_rec, _, reid_sim = self.event_service.register_or_update_subject(
-                            camera_id=camera_id,
-                            track_id=track_id,
-                            bbox=bbox,
-                            match_probability=match_prob,
-                            padded_crop_pil=padded_pil,
-                            full_frame_bgr=frame_bgr,
-                            face_embedding=face_emb,
-                            face_pil=face_pil,
-                        )
+                matched_row, sim = self.vector_db.search_matching_subject(body_emb, now=now)
+                if matched_row is not None:
+                    subject_rec, _, reid_sim = self.event_service.register_or_update_subject(
+                        camera_id=camera_id,
+                        track_id=track_id,
+                        bbox=bbox,
+                        match_probability=match_prob,
+                        padded_crop_pil=padded_pil,
+                        full_frame_bgr=frame_bgr,
+                        face_embedding=body_emb,
+                        face_pil=body_pil,
+                    )
 
             ts = TrackedSubject(
                 camera_id=camera_id,
@@ -331,7 +329,7 @@ class SurveillancePipelineOrchestrator:
                 subject_status=subject_rec.status if subject_rec else None,
                 match_probability=match_prob,
                 detection_rule=self.event_service.current_detection_rule,
-                face_detected=face_detected,
+                face_detected=has_reid,
                 reid_similarity=reid_sim,
             )
             out_tracks.append(ts.to_dict())

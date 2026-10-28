@@ -29,11 +29,18 @@ class PipelineConfig:
     decision_threshold: float = float(os.getenv("DECISION_THRESHOLD", "0.65"))  # Positive match probability threshold
     decision_eval_interval_sec: float = 0.50  # Minimum interval between VLM evaluations per track_id
 
-    # --- 3. Face Detector & Biometric Embedding Model (InsightFace buffalo_l: SCRFD-10GF + ResNet-50 ArcFace) ---
+    # --- 3. Person Re-ID Model (OSNet: Omni-Scale Feature Extractor) ---
+    reid_model_name: str = os.getenv("REID_MODEL_NAME", "osnet_x1_0_msmt17")
+    reid_weights_path: str = os.getenv("REID_WEIGHTS", str(DATA_DIR / "models" / "osnet_x1_0_msmt17.pt"))
+    reid_input_size: tuple[int, int] = (256, 128)
+    reid_match_cosine_threshold: float = float(os.getenv("REID_MATCH_THRESHOLD", "0.65"))
+    embedding_dim: int = 512
+
+    # Backward compatibility aliases for face recognition legacy fields
     face_model_pack: str = os.getenv("FACE_MODEL_PACK", "buffalo_s")
     face_det_size: tuple[int, int] = (640, 640)
     face_det_threshold: float = 0.55
-    embedding_dim: int = 512
+    face_match_cosine_threshold: float = reid_match_cosine_threshold
 
     # --- 4. Vector Database (LanceDB) & Watchlist Retention Policy ---
     lancedb_uri: str = LANCEDB_URI

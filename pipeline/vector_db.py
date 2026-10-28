@@ -105,7 +105,8 @@ class SubjectVectorDB:
                 if r["status"] == "unverified" and 0 < r["expires_at"] <= now:
                     continue
                 sim = 1.0 - float(r["_distance"])
-                if sim >= self.config.face_match_cosine_threshold:
+                threshold = getattr(self.config, "reid_match_cosine_threshold", self.config.face_match_cosine_threshold)
+                if sim >= threshold:
                     return r, sim
 
         return None, 0.0
