@@ -1,6 +1,7 @@
 """Person Detector (Ultralytics YOLO26s) + Multi-Object Tracker (ByteTrack) + Padded Cropper."""
 
 from __future__ import annotations
+import os
 from typing import Any
 import cv2
 import numpy as np
@@ -67,12 +68,17 @@ class PersonDetectorTracker:
 
     @staticmethod
     def _detect_device() -> str:
+        env_dev = os.getenv("TRACKER_DEVICE")
+        if env_dev:
+            return env_dev
         try:
             import torch
             if torch.cuda.is_available():
                 return "cuda"
-            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                return "mps"
+            # On Apple Silicon (MPS), running YOLO concurrently with d1-3B causes
+            # Metal command buffer collision ('A command encoder is already encoding to this command buffer').
+            # Running YOLO on CPU avoids GPU contention and prevents Metal driver aborts.
+            return "cpu"
         except ImportError:
             pass
         return "cpu"

@@ -232,9 +232,12 @@ class EventService:
                 matched_row, sim = self.vector_db.search_matching_subject(face_embedding, now=now)
                 if matched_row is not None:
                     matched_sid = matched_row["subject_id"]
-                    rec = self.flagged_subjects.get(matched_sid)
-                    reid_sim = sim
-                    if rec is not None:
+                    candidate_rec = self.flagged_subjects.get(matched_sid)
+                    # Exclusivity check: A subject cannot simultaneously be two different tracks on the same camera!
+                    active_track_on_cam = candidate_rec.active_tracks.get(camera_id) if candidate_rec else None
+                    if candidate_rec is not None and (active_track_on_cam is None or active_track_on_cam == track_id):
+                        rec = candidate_rec
+                        reid_sim = sim
                         self.track_to_subject[(camera_id, track_id)] = rec.subject_id
                         rec.active_tracks[camera_id] = track_id
                         if camera_id not in rec.cameras_seen:

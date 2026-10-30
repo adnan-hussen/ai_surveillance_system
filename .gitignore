@@ -6,3 +6,4 @@ pipeline/__pycache__
 .venv
 .DS_Store
 .env
+yolo26m.pt

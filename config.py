@@ -14,8 +14,8 @@ INCIDENT_DB_PATH = str(DATA_DIR / "verified_incidents.db")
 @dataclass
 class PipelineConfig:
     # --- 1. Person Detector & Multi-Object Tracker (Ultralytics YOLO26s + ByteTrack) ---
-    yolo_model_path: str = os.getenv("YOLO_MODEL", "yolo26s.pt")
-    person_conf_threshold: float = 0.40
+    yolo_model_path: str = os.getenv("YOLO_MODEL", "yolo26m.pt")
+    person_conf_threshold: float = 0.7
     person_iou_threshold: float = 0.50
     tracker_config: str = "bytetrack.yaml"
     crop_padding_ratio: float = float(os.getenv("CROP_PADDING_RATIO", "0.35"))  # 35% context padding around bbox
@@ -23,7 +23,7 @@ class PipelineConfig:
 
     # --- 2. System-One Decision Model (LiquidAI/d1-3B) ---
     decision_model_id: str = os.getenv("DECISION_MODEL_ID", "LiquidAI/d1-3B")
-    # decision_input_side: int = 384
+    decision_input_side: int = 512
     compile_decision_model: bool = False
     default_detection_rule: str = "Is the person in the frame smoking?"
     decision_threshold: float = float(os.getenv("DECISION_THRESHOLD", "0.65"))  # Positive match probability threshold

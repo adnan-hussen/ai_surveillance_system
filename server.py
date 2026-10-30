@@ -176,6 +176,11 @@ class SurveillancePipelineOrchestrator:
         self._last_eval_result: dict[tuple[str, int], dict[str, Any]] = {}
         self._last_latency_ms = 0.0
 
+        # Dedicated background worker pool for d1-3B so tracking is NEVER blocked
+        self._vlm_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vlm_decision_worker")
+        self._vlm_eval_in_flight: set[tuple[str, int]] = set()
+        self._vlm_lock = threading.Lock()
+
     def start(self) -> None:
         """Loads models and starts camera processing threads + LanceDB TTL reaper thread."""
         self.decision_model.load()
@@ -200,6 +205,7 @@ class SurveillancePipelineOrchestrator:
 
     def stop(self) -> None:
         self._running = False
+        self._vlm_pool.shutdown(wait=False)
 
     def _ttl_reaper_loop(self) -> None:
         while self._running:
@@ -259,7 +265,7 @@ class SurveillancePipelineOrchestrator:
         infer_pool.shutdown(wait=False)
 
     def _evaluate_frame_subjects(self, camera_id: str, frame_bgr: np.ndarray) -> list[dict[str, Any]]:
-        """Asynchronous worker: executes YOLO26s + ByteTrack + d1-3B System-One on keyframes."""
+        """Fast tracking worker (< 15 ms): executes YOLO26s + ByteTrack and delegates d1-3B asynchronously."""
         img_h, img_w = frame_bgr.shape[:2]
         now = time.time()
         raw_tracks = self.detector_tracker.detect_and_track(camera_id, frame_bgr)
@@ -267,28 +273,44 @@ class SurveillancePipelineOrchestrator:
 
         for track_id, det_conf, bbox, padded_pil, tight_bgr in raw_tracks:
             key = (camera_id, track_id)
-            last_eval = self._last_eval_time.get(key, 0.0)
-
-            if (now - last_eval) >= self.config.decision_eval_interval_sec or key not in self._last_eval_result:
-                decision_out = self.decision_model.evaluate_subject_crop(
-                    padded_crop=padded_pil,
-                    detection_rule=self.event_service.current_detection_rule,
-                    camera_id=camera_id,
-                    track_id=track_id,
-                )
-                self._last_eval_time[key] = now
-                self._last_eval_result[key] = decision_out
-                self._last_latency_ms = decision_out["latency_ms"]
-            else:
-                decision_out = self._last_eval_result[key]
-
-            match_prob = float(decision_out["match_probability"])
-            is_triggered = bool(decision_out["is_triggered"])
             existing_subject = self.event_service.resolve_existing_subject_for_track(camera_id, track_id)
+            is_verified = existing_subject is not None and existing_subject.status == "verified"
+
+            # Use cached decision result or default
+            decision_out = self._last_eval_result.get(key)
+            if decision_out is None:
+                if is_verified:
+                    decision_out = {"match_probability": 1.0, "is_triggered": True, "latency_ms": 0.0}
+                else:
+                    decision_out = {"match_probability": 0.0, "is_triggered": False, "latency_ms": 0.0}
+
+            # Asynchronously dispatch to d1-3B in the background (NON-BLOCKING)
+            # Verified subjects bypass d1-3B entirely
+            if not is_verified:
+                last_eval = self._last_eval_time.get(key, 0.0)
+                with self._vlm_lock:
+                    in_flight = key in self._vlm_eval_in_flight
+                    should_eval = (not in_flight) and ((now - last_eval) >= self.config.decision_eval_interval_sec)
+                    if should_eval:
+                        self._vlm_eval_in_flight.add(key)
+
+                if should_eval:
+                    self._vlm_pool.submit(
+                        self._async_evaluate_subject,
+                        camera_id,
+                        track_id,
+                        padded_pil,
+                        tight_bgr.copy(),
+                        bbox,
+                        frame_bgr.copy(),
+                    )
+
+            match_prob = float(decision_out.get("match_probability", 0.0))
+            is_triggered = bool(decision_out.get("is_triggered", False))
             subject_rec = existing_subject
             reid_sim = None
 
-            # Extract 512-D Full-Body Person Re-ID embedding directly from YOLO person crop
+            # Fast 512-D Re-ID embedding directly from YOLO person crop
             body_emb, body_pil = self.reid_embedder.embed_person_crop(tight_bgr)
             has_reid = body_emb is not None
 
@@ -307,16 +329,21 @@ class SurveillancePipelineOrchestrator:
                 # Cross-camera Re-ID check against active watchlist in LanceDB
                 matched_row, sim = self.vector_db.search_matching_subject(body_emb, now=now)
                 if matched_row is not None:
-                    subject_rec, _, reid_sim = self.event_service.register_or_update_subject(
-                        camera_id=camera_id,
-                        track_id=track_id,
-                        bbox=bbox,
-                        match_probability=match_prob,
-                        padded_crop_pil=padded_pil,
-                        full_frame_bgr=frame_bgr,
-                        face_embedding=body_emb,
-                        face_pil=body_pil,
-                    )
+                    matched_sid = matched_row["subject_id"]
+                    existing_subj = self.event_service.flagged_subjects.get(matched_sid)
+                    active_on_cam = existing_subj.active_tracks.get(camera_id) if existing_subj else None
+                    # Only re-associate if not simultaneously occupied by another track on this same camera!
+                    if existing_subj is not None and (active_on_cam is None or active_on_cam == track_id):
+                        subject_rec, _, reid_sim = self.event_service.register_or_update_subject(
+                            camera_id=camera_id,
+                            track_id=track_id,
+                            bbox=bbox,
+                            match_probability=match_prob,
+                            padded_crop_pil=padded_pil,
+                            full_frame_bgr=frame_bgr,
+                            face_embedding=body_emb,
+                            face_pil=body_pil,
+                        )
 
             ts = TrackedSubject(
                 camera_id=camera_id,
@@ -334,6 +361,49 @@ class SurveillancePipelineOrchestrator:
             )
             out_tracks.append(ts.to_dict())
         return out_tracks
+
+    def _async_evaluate_subject(
+        self,
+        camera_id: str,
+        track_id: int,
+        padded_crop: Image.Image,
+        tight_bgr: np.ndarray,
+        bbox: BoundingBox,
+        full_frame_bgr: np.ndarray,
+    ) -> None:
+        """Background worker: evaluates subject crop with d1-3B without blocking real-time tracking."""
+        key = (camera_id, track_id)
+        try:
+            decision_out = self.decision_model.evaluate_subject_crop(
+                padded_crop=padded_crop,
+                detection_rule=self.event_service.current_detection_rule,
+                camera_id=camera_id,
+                track_id=track_id,
+            )
+            self._last_eval_time[key] = time.time()
+            self._last_eval_result[key] = decision_out
+            self._last_latency_ms = decision_out["latency_ms"]
+
+            match_prob = float(decision_out.get("match_probability", 0.0))
+            is_triggered = bool(decision_out.get("is_triggered", False))
+
+            if is_triggered:
+                body_emb, body_pil = self.reid_embedder.embed_person_crop(tight_bgr)
+                self.event_service.register_or_update_subject(
+                    camera_id=camera_id,
+                    track_id=track_id,
+                    bbox=bbox,
+                    match_probability=match_prob,
+                    padded_crop_pil=padded_crop,
+                    full_frame_bgr=full_frame_bgr,
+                    face_embedding=body_emb,
+                    face_pil=body_pil,
+                )
+        except Exception as exc:
+            logger.error("Async VLM evaluation failed for %s: %s", key, exc)
+        finally:
+            with self._vlm_lock:
+                self._vlm_eval_in_flight.discard(key)
 
     def _broadcast_high_fps_stream(
         self, camera_id: str, frame_bgr: np.ndarray, tracks: list[dict[str, Any]]
