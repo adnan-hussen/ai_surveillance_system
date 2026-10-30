@@ -17,7 +17,7 @@ def _select_d1_dtype(torch_mod, device: str):
         return torch_mod.float32
     if device == "mps":
         # Apple Silicon (M1/M2/M3/M4)
-        return torch_mod.bfloat16
+        return torch_mod.float16
     if device == "cuda" and torch_mod.cuda.get_device_capability()[0] >= 8:
         return torch_mod.bfloat16
     return torch_mod.float16
@@ -84,7 +84,7 @@ class DecisionModelEngine:
         """
         t0 = time.perf_counter()
         img = image.convert("RGB")
-        # img.thumbnail((self.config.decision_input_side, self.config.decision_input_side))
+        img.thumbnail((self.config.decision_input_side, self.config.decision_input_side))
 
         import torch
 
