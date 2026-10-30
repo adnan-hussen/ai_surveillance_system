@@ -63,34 +63,39 @@ class Conv1x1Linear(nn.Module):
 
 
 class LightConv3x3(nn.Module):
-    """Depthwise-separable 3x3 light convolution block."""
+    """Depthwise-separable 3x3 light convolution block matching official OSNet."""
     def __init__(self, in_c: int, out_c: int):
         super().__init__()
         self.conv1 = nn.Conv2d(in_c, out_c, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_c)
-        self.relu1 = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(out_c, out_c, 3, padding=1, groups=out_c, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_c)
-        self.relu2 = nn.ReLU(inplace=True)
+        self.bn = nn.BatchNorm2d(out_c)
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.relu1(self.bn1(self.conv1(x)))
-        return self.relu2(self.bn2(self.conv2(x)))
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.bn(x)
+        return self.relu(x)
 
 
 class ChannelGate(nn.Module):
     """Dynamic channel attention gate aggregating multi-scale receptive field streams."""
     def __init__(self, c: int, reduction: int = 16):
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.global_avgpool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Conv2d(c, max(1, c // reduction), 1, bias=True)
         self.relu = nn.ReLU(inplace=True)
         self.fc2 = nn.Conv2d(max(1, c // reduction), c, 1, bias=True)
-        self.sigmoid = nn.Sigmoid()
+        self.gate_activation = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.sigmoid(self.fc2(self.relu(self.fc1(self.pool(x)))))
-        return x * w
+        input = x
+        x = self.global_avgpool(x)
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        x = self.gate_activation(x)
+        return input * x
 
 
 class OSBlock(nn.Module):
@@ -99,12 +104,12 @@ class OSBlock(nn.Module):
         super().__init__()
         mid_c = out_c // 4
         self.conv1 = ConvLayer(in_c, mid_c, 1)
-        self.s1 = LightConv3x3(mid_c, mid_c)
-        self.s2 = nn.Sequential(LightConv3x3(mid_c, mid_c), LightConv3x3(mid_c, mid_c))
-        self.s3 = nn.Sequential(
+        self.conv2a = LightConv3x3(mid_c, mid_c)
+        self.conv2b = nn.Sequential(LightConv3x3(mid_c, mid_c), LightConv3x3(mid_c, mid_c))
+        self.conv2c = nn.Sequential(
             LightConv3x3(mid_c, mid_c), LightConv3x3(mid_c, mid_c), LightConv3x3(mid_c, mid_c)
         )
-        self.s4 = nn.Sequential(
+        self.conv2d = nn.Sequential(
             LightConv3x3(mid_c, mid_c),
             LightConv3x3(mid_c, mid_c),
             LightConv3x3(mid_c, mid_c),
@@ -117,7 +122,7 @@ class OSBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.downsample(x) if self.downsample else x
         x1 = self.conv1(x)
-        out = self.s1(x1) + self.s2(x1) + self.s3(x1) + self.s4(x1)
+        out = self.conv2a(x1) + self.conv2b(x1) + self.conv2c(x1) + self.conv2d(x1)
         out = self.gate(out)
         out = self.conv3(out)
         return F.relu(out + residual, inplace=True)
@@ -135,50 +140,40 @@ class OSNet(nn.Module):
         self.conv1 = ConvLayer(3, channels[0], 7, s=2, p=3)
         self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
 
-        # Stage 2
-        layers2 = [OSBlock(channels[0], channels[1])]
-        for _ in range(blocks[0] - 1):
-            layers2.append(OSBlock(channels[1], channels[1]))
-        self.conv2 = nn.Sequential(*layers2)
-
-        # Transition 2 -> 3
-        self.pool2 = nn.Sequential(
-            ConvLayer(channels[1], channels[1], 1),
-            nn.AvgPool2d(2, stride=2),
+        # Stage 2 + transition
+        self.conv2 = nn.Sequential(
+            OSBlock(channels[0], channels[1]),
+            OSBlock(channels[1], channels[1]),
+            nn.Sequential(ConvLayer(channels[1], channels[1], 1), nn.AvgPool2d(2, stride=2)),
         )
 
-        # Stage 3
-        layers3 = [OSBlock(channels[1], channels[2])]
-        for _ in range(blocks[1] - 1):
-            layers3.append(OSBlock(channels[2], channels[2]))
-        self.conv3 = nn.Sequential(*layers3)
-
-        # Transition 3 -> 4
-        self.pool3 = nn.Sequential(
-            ConvLayer(channels[2], channels[2], 1),
-            nn.AvgPool2d(2, stride=2),
+        # Stage 3 + transition
+        self.conv3 = nn.Sequential(
+            OSBlock(channels[1], channels[2]),
+            OSBlock(channels[2], channels[2]),
+            nn.Sequential(ConvLayer(channels[2], channels[2], 1), nn.AvgPool2d(2, stride=2)),
         )
 
         # Stage 4
-        layers4 = [OSBlock(channels[2], channels[3])]
-        for _ in range(blocks[2] - 1):
-            layers4.append(OSBlock(channels[3], channels[3]))
-        self.conv4 = nn.Sequential(*layers4)
+        self.conv4 = nn.Sequential(
+            OSBlock(channels[2], channels[3]),
+            OSBlock(channels[3], channels[3]),
+        )
 
         self.conv5 = ConvLayer(channels[3], channels[3], 1)
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_avgpool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
-            nn.Linear(channels[3], feature_dim, bias=False),
+            nn.Linear(channels[3], feature_dim, bias=True),
             nn.BatchNorm1d(feature_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.maxpool(self.conv1(x))
-        x = self.pool2(self.conv2(x))
-        x = self.pool3(self.conv3(x))
+        x = self.conv2(x)
+        x = self.conv3(x)
         x = self.conv4(x)
         x = self.conv5(x)
-        v = self.global_pool(x).flatten(1)
+        v = self.global_avgpool(x).flatten(1)
         feat = self.fc(v)
         return F.normalize(feat, p=2, dim=1)
 
@@ -196,10 +191,12 @@ class PersonReIDEmbedder:
 
     @staticmethod
     def _detect_device() -> str:
+        env_dev = os.getenv("REID_DEVICE")
+        if env_dev:
+            return env_dev
         if torch.cuda.is_available():
             return "cuda"
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return "mps"
+        # On Apple Silicon (MPS), keep OSNet on CPU to avoid Metal command buffer collisions with d1-3B.
         return "cpu"
 
     def load(self) -> None:
@@ -214,9 +211,12 @@ class PersonReIDEmbedder:
             if fallback_path.is_file():
                 weights_path = fallback_path
 
-        if weights_path.is_file():
+        if weights_path.is_file() and weights_path.stat().st_size > 1000:
             try:
-                state_dict = torch.load(str(weights_path), map_location="cpu", weights_only=True)
+                try:
+                    state_dict = torch.load(str(weights_path), map_location="cpu", weights_only=True)
+                except Exception:
+                    state_dict = torch.load(str(weights_path), map_location="cpu", weights_only=False)
                 if isinstance(state_dict, dict) and "state_dict" in state_dict:
                     state_dict = state_dict["state_dict"]
                 # Strip 'module.' prefix if saved with DataParallel
